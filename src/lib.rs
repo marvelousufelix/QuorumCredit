@@ -119,7 +119,8 @@ impl Config {
 #[derive(Clone)]
 pub struct LoanRecord {
     pub borrower: Address,
-    pub amount: i128, // in stroops
+    pub amount: i128,       // total loan principal in stroops
+    pub amount_repaid: i128, // cumulative repayments received so far
     pub repaid: bool,
     pub defaulted: bool,
     pub created_at: u64, // ledger timestamp
@@ -352,6 +353,16 @@ impl QuorumCreditContract {
         }
 
         // Check collateral ratio: amount must not exceed total_stake * ratio / 100
+        let max_ratio: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinVouchers)
+            .unwrap_or(0);
+        if vouches.len() < min_vouchers {
+            return Err(ContractError::InsufficientVouchers);
+        }
+
+        // Check collateral ratio: amount must not exceed total_stake * ratio / 100
         let cfg = Self::config(&env);
         let max_allowed_loan = total_stake * cfg.max_loan_to_stake_ratio as i128 / 100;
         assert!(
@@ -374,6 +385,7 @@ impl QuorumCreditContract {
             &LoanRecord {
                 borrower: borrower.clone(),
                 amount,
+                amount_repaid: 0,
                 repaid: false,
                 defaulted: false,
                 created_at: now,
@@ -392,8 +404,14 @@ impl QuorumCreditContract {
         Ok(())
     }
 
-    /// Borrower repays loan; vouchers receive 2% yield on their stake.
-    pub fn repay(env: Env, borrower: Address) -> Result<(), ContractError> {
+    /// Borrower repays all or part of the loan.
+    ///
+    /// `payment` is the amount being paid in this call (in stroops). It must be
+    /// at least 1 stroop and cannot exceed the outstanding balance. When the
+    /// cumulative `amount_repaid` reaches `amount`, the loan is marked fully
+    /// repaid and each voucher receives their stake back plus a proportional
+    /// share of the 2% yield (proportional to their stake / total_stake).
+    pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
         borrower.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -408,14 +426,19 @@ impl QuorumCreditContract {
         }
         assert!(!loan.defaulted, "loan already defaulted");
         assert!(!loan.repaid, "loan already repaid");
-
-        // Block repayment after deadline — borrower must be auto-slashed instead.
         assert!(
             env.ledger().timestamp() <= loan.deadline,
             "loan deadline has passed"
         );
 
+        let outstanding = loan.amount - loan.amount_repaid;
+        assert!(payment > 0 && payment <= outstanding, "invalid payment amount");
+
         let token = Self::token(&env);
+
+        // Collect this installment from the borrower.
+        token.transfer(&borrower, &env.current_contract_address(), &payment);
+        loan.amount_repaid += payment;
         let cfg = Self::config(&env);
         let vouches: Vec<VouchRecord> = env
             .storage()
@@ -430,15 +453,25 @@ impl QuorumCreditContract {
             total_payout += v.stake + yield_amount;
         }
 
-        // Collect repayment from borrower first.
-        token.transfer(&borrower, &env.current_contract_address(), &loan.amount);
+        if loan.amount_repaid >= loan.amount {
+            // Fully repaid — distribute stake + proportional yield to each voucher.
+            let vouches: Vec<VouchRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Vouches(borrower.clone()))
+                .unwrap_or(Vec::new(&env));
 
-        let contract_balance = token.balance(&env.current_contract_address());
-        assert!(
-            contract_balance >= total_payout,
-            "insufficient contract balance for yield distribution"
-        );
+            let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
+            // Total yield pool = loan.amount * YIELD_BPS / 10_000
+            let total_yield = loan.amount * YIELD_BPS / 10_000;
+
+            // Pre-check contract balance covers all payouts.
+            let total_payout = total_stake + total_yield;
+            let contract_balance = token.balance(&env.current_contract_address());
+            assert!(
+                contract_balance >= total_payout,
+                "insufficient contract balance for yield distribution"
         // Return stake + yield to each voucher.
         for v in vouches.iter() {
             let yield_amount = v.stake * cfg.yield_bps / 10_000;
@@ -447,9 +480,24 @@ impl QuorumCreditContract {
                 &v.voucher,
                 &(v.stake + yield_amount),
             );
+
+            for v in vouches.iter() {
+                // Each voucher's yield is proportional to their share of total stake.
+                let voucher_yield = if total_stake > 0 {
+                    total_yield * v.stake / total_stake
+                } else {
+                    0
+                };
+                token.transfer(
+                    &env.current_contract_address(),
+                    &v.voucher,
+                    &(v.stake + voucher_yield),
+                );
+            }
+
+            loan.repaid = true;
         }
 
-        loan.repaid = true;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
@@ -1228,9 +1276,12 @@ mod tests {
 
         client.vouch(&voucher, &borrower, &1_000_000);
         client.request_loan(&borrower, &500_000, &1_000_000);
-        client.repay(&borrower);
+        client.repay(&borrower, &500_000);
 
-        assert_eq!(token.balance(&voucher), 10_020_000);
+        // Yield = loan_amount * 2% = 500_000 * 200 / 10_000 = 10_000
+        // Voucher gets back stake (1_000_000) + yield (10_000) = 1_010_000
+        // Net balance: 10_000_000 - 1_000_000 (staked) + 1_010_000 = 10_010_000
+        assert_eq!(token.balance(&voucher), 10_010_000);
     }
 
     #[test]
@@ -1405,7 +1456,7 @@ mod tests {
         client.request_loan(&borrower, &1_500_000, &1_000_000);
 
         // Repay the first loan
-        client.repay(&borrower);
+        client.repay(&borrower, &1_500_000);
 
         // This should fail - exceeds 150% ratio (2_000_000 > 1_500_000)
         let result = client.try_request_loan(&borrower, &2_000_000, &1_000_000);
@@ -1457,7 +1508,7 @@ mod tests {
         );
 
         // Repay
-        client.repay(&borrower);
+        client.repay(&borrower, &500_000);
 
         // Check loan is repaid
         let loan = client.get_loan(&borrower).unwrap();
@@ -1471,7 +1522,7 @@ mod tests {
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         // Try to repay a loan that doesn't exist
-        let result = client.try_repay(&borrower);
+        let result = client.try_repay(&borrower, &100_000);
         assert_eq!(
             result,
             Err(Ok(ContractError::NoActiveLoan)),
@@ -1610,7 +1661,7 @@ mod tests {
         client.request_loan(&borrower, &500_000, &1_000_000);
         client.pause();
 
-        let result = client.try_repay(&borrower);
+        let result = client.try_repay(&borrower, &500_000);
         assert_eq!(result, Err(Ok(ContractError::ContractPaused)));
     }
 
@@ -1737,7 +1788,7 @@ mod tests {
         // Advance past deadline.
 
         env.ledger().set_timestamp(1_002_000);
-        client.repay(&borrower);
+        client.repay(&borrower, &500_000);
     }
 
     #[test]
@@ -1963,6 +2014,12 @@ mod tests {
         client.vouch(&voucher, &borrower, &1_000_000);
         client.request_loan(&borrower, &500_000, &1_000_000);
         assert_eq!(client.get_loan(&borrower).unwrap().amount, 500_000);
+    }
+
+    // ── Partial Repayment Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_partial_repay_updates_amount_repaid() {
     #[test]
     fn test_get_contract_balance() {
         let env = Env::default();
@@ -2037,6 +2094,83 @@ mod tests {
         let (contract_id, _, _, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &600_000, &1_000_000);
+
+        client.repay(&borrower, &200_000);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan.amount_repaid, 200_000);
+        assert!(!loan.repaid, "loan should not be marked repaid after partial payment");
+    }
+
+    #[test]
+    fn test_full_repay_via_installments_marks_repaid_and_pays_yield() {
+        let env = Env::default();
+        let (contract_id, token_addr, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token = TokenClient::new(&env, &token_addr);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &600_000, &1_000_000);
+
+        // Pay in two installments.
+        client.repay(&borrower, &400_000);
+        assert!(!client.get_loan(&borrower).unwrap().repaid);
+
+        client.repay(&borrower, &200_000);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        assert!(loan.repaid);
+        assert_eq!(loan.amount_repaid, 600_000);
+
+        // Voucher should have stake (1_000_000) + 2% yield on 600_000 (12_000) = 1_012_000
+        // Starting balance was 10_000_000, staked 1_000_000, so net = 10_012_000
+        assert_eq!(token.balance(&voucher), 10_012_000);
+    }
+
+    #[test]
+    fn test_single_full_repay_still_works() {
+        let env = Env::default();
+        let (contract_id, token_addr, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token = TokenClient::new(&env, &token_addr);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower, &500_000);
+
+        assert!(client.get_loan(&borrower).unwrap().repaid);
+        // 2% yield on 500_000 = 10_000; voucher gets back 1_000_000 + 10_000
+        assert_eq!(token.balance(&voucher), 10_010_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid payment amount")]
+    fn test_repay_zero_amount_panics() {
+        let env = Env::default();
+        let (contract_id, _, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid payment amount")]
+    fn test_repay_exceeds_outstanding_panics() {
+        let env = Env::default();
+        let (contract_id, _, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower, &600_000);
+    }
+
+    #[test]
+    fn test_partial_repay_proportional_yield_two_vouchers() {
         assert!(!client.vouch_exists(&voucher, &borrower));
         client.vouch(&voucher, &borrower, &1_000_000);
         assert!(client.vouch_exists(&voucher, &borrower));
@@ -2264,6 +2398,27 @@ mod tests {
         let (contract_id, token_addr, _, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         let token = TokenClient::new(&env, &token_addr);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+
+        let voucher2 = Address::generate(&env);
+        token_admin.mint(&voucher2, &10_000_000);
+
+        // voucher stakes 1_000_000, voucher2 stakes 3_000_000 → total 4_000_000
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.vouch(&voucher2, &borrower, &3_000_000);
+        client.request_loan(&borrower, &400_000, &1_000_000);
+
+        // Repay in two installments.
+        client.repay(&borrower, &100_000);
+        client.repay(&borrower, &300_000);
+
+        assert!(client.get_loan(&borrower).unwrap().repaid);
+
+        // Total yield = 400_000 * 200 / 10_000 = 8_000
+        // voucher  share = 8_000 * 1_000_000 / 4_000_000 = 2_000  → gets 1_002_000
+        // voucher2 share = 8_000 * 3_000_000 / 4_000_000 = 6_000  → gets 3_006_000
+        assert_eq!(token.balance(&voucher), 10_002_000);
+        assert_eq!(token.balance(&voucher2), 10_006_000);
 
         // Set yield to 5% (500 bps).
         let mut cfg = client.get_config();
