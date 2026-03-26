@@ -278,12 +278,10 @@ impl QuorumCreditContract {
         Self::do_vouch(&env, voucher, borrower, stake)
     }
 
-    fn do_vouch(
-        env: &Env,
-        voucher: Address,
-        borrower: Address,
-        stake: i128,
-    ) -> Result<(), ContractError> {
+        if !Self::is_whitelisted(env.clone(), voucher.clone()) {
+            return Err(ContractError::VoucherNotWhitelisted);
+        }
+
         // Validate numeric input: stake must be strictly positive.
         Self::require_positive_amount(env, stake)?;
 
@@ -1066,16 +1064,7 @@ impl QuorumCreditContract {
         env.storage().persistent().get(&DataKey::Timelock(proposal_id))
     }
 
-    /// Withdraw a vouch before any loan is active, returning the exact stake to the voucher.
-    ///
-    /// Fails with `ContractError::PoolBorrowerActiveLoan` if the borrower currently
-    /// has an active (non-repaid, non-defaulted) loan. Repaid or defaulted loan
-    /// records in storage do not block withdrawal.
-    pub fn withdraw_vouch(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-    ) -> Result<(), ContractError> {
+    pub fn withdraw_vouch(env: Env, voucher: Address, borrower: Address) {
         voucher.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -1187,6 +1176,95 @@ impl QuorumCreditContract {
             total_slash += v.stake * cfg.slash_bps / 10_000;
         }
         let treasury: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoucherHistory(from.clone()))
+            .unwrap_or(Vec::new(&env));
+        if let Some(h_idx) = from_history.iter().position(|b| b == borrower) {
+            from_history.remove(h_idx as u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::VoucherHistory(from.clone()), &from_history);
+        }
+
+        // 2. Add borrower to 'to' history if not already there
+        let mut to_history: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoucherHistory(to.clone()))
+            .unwrap_or(Vec::new(&env));
+        if !to_history.iter().any(|b| b == borrower) {
+            to_history.push_back(borrower.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::VoucherHistory(to.clone()), &to_history);
+        }
+
+        env.events().publish(
+            (symbol_short!("vouch"), symbol_short!("transfer")),
+            (from, to, borrower, stake_to_transfer),
+        );
+
+        Ok(())
+    }
+
+    /// Transfer ownership of a stake position for a borrower from one address to another.
+    pub fn transfer_vouch(
+        env: Env,
+        from: Address,
+        to: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        from.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if from == to {
+            return Ok(());
+        }
+
+        // Only allow transfer before a loan is active (consistent with withdraw_vouch).
+        assert!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, LoanRecord>(&DataKey::Loan(borrower.clone()))
+                .is_none(),
+            "loan already active"
+        );
+
+        let mut vouches: Vec<VouchRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vouches(borrower.clone()))
+            .expect("vouch not found");
+
+        let from_idx = vouches
+            .iter()
+            .position(|v| v.voucher == from)
+            .expect("from voucher not found") as u32;
+
+        let from_record = vouches.get(from_idx).unwrap();
+        let stake_to_transfer = from_record.stake;
+
+        if let Some(to_idx) = vouches.iter().position(|v| v.voucher == to) {
+            // Merge into existing record for 'to'
+            let mut to_record = vouches.get(to_idx as u32).unwrap();
+            to_record.stake += stake_to_transfer;
+            vouches.set(to_idx as u32, to_record);
+            vouches.remove(from_idx);
+        } else {
+            // Transfer ownership to 'to'
+            let mut updated_record = from_record;
+            updated_record.voucher = to.clone();
+            vouches.set(from_idx, updated_record);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vouches(borrower.clone()), &vouches);
+
+        // Update voucher histories
+        // 1. Remove borrower from 'from' history
+        let mut from_history: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::VoucherHistory(from.clone()))
@@ -1666,6 +1744,14 @@ impl QuorumCreditContract {
         );
     }
 
+    /// Admin whitelists a voucher to allow them to stake/vouch for borrowers.
+    pub fn whitelist_voucher(env: Env, admin_signers: Vec<Address>, voucher: Address) {
+        Self::require_admin_approval(&env, &admin_signers);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VoucherWhitelist(voucher), &true);
+    }
+
     /// Returns the current protocol fee (0 if not set).
     pub fn get_protocol_fee(env: Env) -> u32 {
         env.storage()
@@ -1759,6 +1845,13 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower))
             .unwrap_or(Vec::new(&env));
         vouches.iter().any(|v| v.voucher == voucher)
+    }
+
+    pub fn is_whitelisted(env: Env, voucher: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VoucherWhitelist(voucher))
+            .unwrap_or(false)
     }
 
     pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {
@@ -2234,12 +2327,15 @@ mod tests {
         let contract_id = env.register_contract(None, QuorumCreditContract);
         token_admin.mint(&contract_id, &50_000_000);
 
-        QuorumCreditContractClient::new(env, &contract_id).initialize(
+        let client = QuorumCreditContractClient::new(env, &contract_id);
+        client.initialize(
             &admin,
             &admins,
             &1,
             &token_id.address(),
         );
+
+        client.whitelist_voucher(&admins, &voucher);
 
         (contract_id, token_id.address(), admin, borrower, voucher)
     }
@@ -2267,7 +2363,8 @@ mod tests {
         let contract_id = env.register_contract(None, QuorumCreditContract);
         token_admin.mint(&contract_id, &50_000_000);
 
-        QuorumCreditContractClient::new(env, &contract_id).initialize(
+        let client = QuorumCreditContractClient::new(env, &contract_id);
+        client.initialize(
             &admin_one,
             &admins,
             &admin_threshold,
@@ -4122,6 +4219,8 @@ mod tests {
         let voucher2 = Address::generate(&env);
         token_admin.mint(&voucher1, &10_000_000);
         token_admin.mint(&voucher2, &10_000_000);
+        client.whitelist_voucher(&admin_signers, &voucher1);
+        client.whitelist_voucher(&admin_signers, &voucher2);
         client.vouch(&voucher1, &borrower1, &2_000_000);
         client.vouch(&voucher2, &borrower2, &2_000_000);
 
@@ -4159,6 +4258,7 @@ mod tests {
         let b1 = Address::generate(&env);
         let v1 = Address::generate(&env);
         token_admin.mint(&v1, &10_000_000);
+        client.whitelist_voucher(&admin_signers, &v1);
         client.vouch(&v1, &b1, &2_000_000);
         let mut bs1 = Vec::new(&env);
         bs1.push_back(b1);
@@ -4169,6 +4269,7 @@ mod tests {
         let b2 = Address::generate(&env);
         let v2 = Address::generate(&env);
         token_admin.mint(&v2, &10_000_000);
+        client.whitelist_voucher(&admin_signers, &v2);
         client.vouch(&v2, &b2, &2_000_000);
         let mut bs2 = Vec::new(&env);
         bs2.push_back(b2);
@@ -4801,5 +4902,193 @@ mod tests {
             .try_initialize(&deployer, &admin, &zero_token);
 
         assert_eq!(result, Err(Ok(ContractError::ZeroAddress)));
+    }
+
+    #[test]
+    fn test_transfer_vouch_success() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, from) = setup(&env);
+        let to = Address::generate(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&from, &borrower, &1_000_000);
+
+        assert!(client.vouch_exists(&from, &borrower));
+        assert!(!client.vouch_exists(&to, &borrower));
+        assert!(client.voucher_history(&from).contains(borrower.clone()));
+        assert!(!client.voucher_history(&to).contains(borrower.clone()));
+
+        client.transfer_vouch(&from, &to, &borrower);
+
+        assert!(!client.vouch_exists(&from, &borrower));
+        assert!(client.vouch_exists(&to, &borrower));
+        assert!(!client.voucher_history(&from).contains(borrower.clone()));
+        assert!(client.voucher_history(&to).contains(borrower.clone()));
+
+        let vouches = client.get_vouches(&borrower).unwrap();
+        assert_eq!(vouches.len(), 1);
+        assert_eq!(vouches.get(0).unwrap().voucher, to);
+        assert_eq!(vouches.get(0).unwrap().stake, 1_000_000);
+    }
+
+    #[test]
+    fn test_transfer_vouch_merge() {
+        let env = Env::default();
+        let (contract_id, token_addr, admin, borrower, from) = setup(&env);
+        let to = Address::generate(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+        token_admin.mint(&to, &10_000_000);
+        let admin_signers = single_admin_signers(&env, &admin);
+        client.whitelist_voucher(&admin_signers, &to);
+
+        client.vouch(&from, &borrower, &1_000_000);
+        client.vouch(&to, &borrower, &2_000_000);
+
+        assert_eq!(client.get_vouches(&borrower).unwrap().len(), 2);
+
+        client.transfer_vouch(&from, &to, &borrower);
+
+        assert!(!client.vouch_exists(&from, &borrower));
+        assert!(client.vouch_exists(&to, &borrower));
+
+        let vouches = client.get_vouches(&borrower).unwrap();
+        assert_eq!(vouches.len(), 1);
+        assert_eq!(vouches.get(0).unwrap().voucher, to);
+        assert_eq!(vouches.get(0).unwrap().stake, 3_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "loan already active")]
+    fn test_transfer_vouch_active_loan_fails() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, from) = setup(&env);
+        let to = Address::generate(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&from, &borrower, &2_000_000);
+        client.request_loan(&borrower, &1_000_000, &2_000_000);
+
+        client.transfer_vouch(&from, &to, &borrower);
+    }
+
+    #[test]
+    #[should_panic(expected = "from voucher not found")]
+    fn test_transfer_vouch_not_found_fails() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, from) = setup(&env);
+        let to = Address::generate(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        // 'from' never vouched
+        client.transfer_vouch(&from, &to, &borrower);
+    }
+
+    #[test]
+    fn test_transfer_vouch_same_address_noop() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, from) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&from, &borrower, &1_000_000);
+        client.transfer_vouch(&from, &from, &borrower);
+
+        assert!(client.vouch_exists(&from, &borrower));
+        assert_eq!(client.get_vouches(&borrower).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_slash_treasury_accumulation() {
+        let env = Env::default();
+        let (contract_id, _token_addr, admin, borrower1, voucher) = setup(&env);
+        let borrower2 = Address::generate(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        // Initial balance should be 0
+        assert_eq!(client.get_slash_treasury_balance(), 0);
+
+        // First slash (manual admin slash)
+        client.vouch(&voucher, &borrower1, &1_000_000);
+        client.request_loan(&borrower1, &Vec::new(&env), &500_000, &1_000_000);
+        client.slash(&admin_signers, &borrower1);
+
+        // Stake was 1M, slash_bps is 5000 (50%), so 500k slashed
+        assert_eq!(client.get_slash_treasury_balance(), 500_000);
+
+        // Second slash (auto_slash after deadline)
+        client.vouch(&voucher, &borrower2, &2_000_000);
+        client.request_loan(&borrower2, &Vec::new(&env), &1_000_000, &2_000_000);
+        
+        let loan = client.get_loan(&borrower2).unwrap();
+        env.ledger().set_timestamp(loan.deadline + 1);
+        client.auto_slash(&borrower2);
+
+        // Stake was 2M, 50% is 1M. Total: 500k + 1M = 1.5M
+        assert_eq!(client.get_slash_treasury_balance(), 1_500_000);
+    }
+
+    // ── Whitelist Tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_whitelist_voucher_success() {
+        let env = Env::default();
+        let (contract_id, _token_addr, admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        let new_voucher = Address::generate(&env);
+        assert!(!client.is_whitelisted(&new_voucher));
+
+        client.whitelist_voucher(&admin_signers, &new_voucher);
+        assert!(client.is_whitelisted(&new_voucher));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized admin signer")]
+    fn test_whitelist_voucher_unauthorized() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let fake_admin = Address::generate(&env);
+        let fake_signers = single_admin_signers(&env, &fake_admin);
+        let new_voucher = Address::generate(&env);
+
+        client.whitelist_voucher(&fake_signers, &new_voucher);
+    }
+
+    #[test]
+    fn test_vouch_requires_whitelist() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let unwhitelisted = Address::generate(&env);
+        // Mint some tokens so focus is on whitelist and not balance
+        let token_id = client.get_token();
+        let token_admin = StellarAssetClient::new(&env, &token_id);
+        token_admin.mint(&unwhitelisted, &10_000_000);
+
+        let result = client.try_vouch(&unwhitelisted, &borrower, &1_000_000);
+        assert_eq!(result, Err(Ok(ContractError::VoucherNotWhitelisted)));
+    }
+
+    #[test]
+    fn test_whitelisted_voucher_can_vouch() {
+        let env = Env::default();
+        let (contract_id, _token_addr, admin, borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        let new_voucher = Address::generate(&env);
+        let token_id = client.get_token();
+        let token_admin = StellarAssetClient::new(&env, &token_id);
+        token_admin.mint(&new_voucher, &10_000_000);
+
+        client.whitelist_voucher(&admin_signers, &new_voucher);
+        client.vouch(&new_voucher, &borrower, &1_000_000);
+
+        assert!(client.vouch_exists(&new_voucher, &borrower));
     }
 }
