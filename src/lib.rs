@@ -219,6 +219,7 @@ impl QuorumCreditContract {
         Self::require_positive_amount(&env, stake)?;
 
         assert!(voucher != borrower, "voucher cannot vouch for self");
+        assert!(stake > 0, "stake must be greater than zero");
 
         let cfg = Self::config(&env);
 
@@ -1486,6 +1487,18 @@ mod tests {
         let (contract_id, _token_addr, _admin, borrower, _voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         client.vouch(&borrower, &borrower, &1_000_000);
+    }
+
+    /// Issue 4: a zero-stake vouch must be rejected to prevent inflating the
+    /// vouch count without contributing to the loan threshold.
+    #[test]
+    #[should_panic(expected = "stake must be greater than zero")]
+    fn test_vouch_zero_stake_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &0);
     }
 
     #[test]
