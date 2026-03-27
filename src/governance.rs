@@ -22,7 +22,7 @@ pub fn vote_slash(
 
     // Borrower must have an active loan to be slashable.
     let loan = get_active_loan_record(&env, &borrower)?;
-    if loan.repaid || loan.defaulted {
+    if loan.status != crate::types::LoanStatus::Active {
         return Err(ContractError::NoActiveLoan);
     }
 
@@ -157,7 +157,7 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 
     add_slash_balance(env, total_slashed);
 
-    loan.defaulted = true;
+    loan.status = crate::types::LoanStatus::Defaulted;
     env.storage()
         .persistent()
         .set(&DataKey::Loan(loan.id), &loan);

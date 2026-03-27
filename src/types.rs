@@ -107,8 +107,7 @@ pub struct LoanRecord {
     pub amount: i128,        // total loan principal in stroops
     pub amount_repaid: i128, // cumulative repayments received so far (principal + yield)
     pub total_yield: i128,   // yield owed to vouchers, locked in at disbursement
-    pub repaid: bool,
-    pub defaulted: bool,
+    pub status: LoanStatus,
     pub created_at: u64,                  // ledger timestamp
     pub disbursement_timestamp: u64,      // ledger timestamp
     pub repayment_timestamp: Option<u64>, // set once the loan is fully repaid

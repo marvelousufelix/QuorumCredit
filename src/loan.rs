@@ -150,8 +150,7 @@ pub fn request_loan(
             amount,
             amount_repaid: 0,
             total_yield,
-            repaid: false,
-            defaulted: false,
+            status: LoanStatus::Active,
             created_at: now,
             disbursement_timestamp: now,
             repayment_timestamp: None,
@@ -199,12 +198,9 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
     if borrower != loan.borrower {
         return Err(ContractError::UnauthorizedCaller);
     }
-    if loan.defaulted || loan.repaid {
+    if loan.status != LoanStatus::Active {
         return Err(ContractError::NoActiveLoan);
     }
-
-    assert!(!loan.defaulted, "loan already defaulted");
-    assert!(!loan.repaid, "loan already repaid");
     assert!(
         env.ledger().timestamp() <= loan.deadline,
         "loan deadline has passed"
@@ -271,7 +267,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             );
         }
 
-        loan.repaid = true;
+        loan.status = LoanStatus::Repaid;
         loan.repayment_timestamp = Some(env.ledger().timestamp());
 
         // Pay referral bonus if a referrer is registered.
@@ -337,9 +333,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
 pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
     match crate::helpers::get_latest_loan_record(&env, &borrower) {
         None => LoanStatus::None,
-        Some(loan) if loan.repaid => LoanStatus::Repaid,
-        Some(loan) if loan.defaulted => LoanStatus::Defaulted,
-        _ => LoanStatus::Active,
+        Some(loan) => loan.status,
     }
 }
 
@@ -357,7 +351,7 @@ pub fn is_eligible(env: Env, borrower: Address, threshold: i128) -> bool {
     }
 
     if let Some(loan) = crate::helpers::get_latest_loan_record(&env, &borrower) {
-        if !loan.repaid && !loan.defaulted {
+        if loan.status == LoanStatus::Active {
             return false;
         }
     }
