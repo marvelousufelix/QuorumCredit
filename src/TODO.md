@@ -1,14 +1,11 @@
 # QuorumCredit TODO / Progress Tracker
 
 ## Active Tasks
-
-### Issue #137: Add Test - Slash Calculation Precision with Small Stakes
-- [x] ~Create detailed edit plan and get approval~
-- [x] Create `src/slash_precision_small_stake_test.rs` with test cases for stakes 1, 10, 19 stroops
-- [x] Verify test passes: `cargo test slash_precision_small_stake_test --lib`
-- [x] Run full suite: `cargo test --lib`
-- [x] Update TODO.md
+*(none)*
 
 ## Completed Tasks
 - Issue #137: Slash precision test fully implemented and verified ✅
-
+- Issue #138: Repay multi-voucher yield test implemented in src/repay_multi_voucher_yield_test.rs
+  - 3 vouchers (300k/200k/100k stakes)
+  - Repay asserts stake + proportional 2% yield each
+  - Vouches cleared post-repay ✅
