@@ -10,64 +10,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Clippy
+  ci:
+    name: Build & Test
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            QuorumCredit/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('QuorumCredit/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: Run clippy
-        working-directory: QuorumCredit
-        run: cargo clippy -- -D warnings
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            QuorumCredit/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('QuorumCredit/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: Run tests
-        working-directory: QuorumCredit
-        run: cargo test
-
-  build-wasm:
-    name: Build WASM
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable + wasm32 target
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -75,17 +30,22 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            QuorumCredit/target
-          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('QuorumCredit/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-wasm-
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build WASM artifact
+      - name: Check Formatting
+        working-directory: QuorumCredit
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: QuorumCredit
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: QuorumCredit
+        run: cargo test
+
+      - name: Build (WASM)
         working-directory: QuorumCredit
         run: cargo build --target wasm32-unknown-unknown --release
-
-      - name: Upload WASM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: quorum_credit_wasm
-          path: QuorumCredit/target/wasm32-unknown-unknown/release/quorum_credit.wasm
-          if-no-files-found: error
