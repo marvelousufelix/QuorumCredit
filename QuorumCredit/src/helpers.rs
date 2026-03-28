@@ -98,6 +98,19 @@ pub fn get_latest_loan_record(env: &Env, borrower: &Address) -> Option<LoanRecor
     }
 }
 
+/// Validates that a loan record is in Active status.
+/// Returns `Err(NoActiveLoan)` for non-active loans, panics with a message for already-repaid loans.
+pub fn validate_loan_active(loan: &LoanRecord) -> Result<(), ContractError> {
+    if loan.status != crate::types::LoanStatus::Active {
+        if loan.status == crate::types::LoanStatus::Repaid {
+            panic!("loan already repaid");
+        } else {
+            return Err(ContractError::NoActiveLoan);
+        }
+    }
+    Ok(())
+}
+
 pub fn get_active_loan_record(env: &Env, borrower: &Address) -> Result<LoanRecord, ContractError> {
     let loan_id: u64 = env
         .storage()
