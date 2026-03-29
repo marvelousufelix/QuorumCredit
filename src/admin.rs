@@ -22,6 +22,14 @@ pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
 pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
     require_admin_approval(&env, &admin_signers);
 
+    // Issue #372: Prevent removing an admin who is one of the signers
+    for signer in admin_signers.iter() {
+        assert!(
+            signer != admin_to_remove,
+            "cannot remove an admin who is a signer of this transaction"
+        );
+    }
+
     let mut cfg = config(&env);
 
     let idx = cfg
