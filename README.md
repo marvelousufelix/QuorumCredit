@@ -470,9 +470,11 @@ Please refer to [CONTRIBUTING.md](CONTRIBUTING.md) for our full guidelines on:
 
 ## Security
 
+See [SECURITY.md](SECURITY.md) for the full vulnerability disclosure policy and contact information.
+
 - Never commit `.env` files or secret keys
 - Use hardware wallets or multisig for admin keys
-- Report vulnerabilities privately — do not open public issues
+- Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/your-org/QuorumCredit/security/advisories/new) — do not open public issues
 - **Dependency Scanning**: `cargo audit` runs automatically in CI. Any high-severity vulnerability will fail the build. Run manually via `cargo install cargo-audit && cargo audit`.
 
 ---
