@@ -378,7 +378,7 @@ pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Addres
 }
 
 pub fn get_admins(env: Env) -> Vec<Address> {
-    config(&env).admins
+    crate::helpers::get_admins(&env)
 }
 
 pub fn get_admin_threshold(env: Env) -> u32 {

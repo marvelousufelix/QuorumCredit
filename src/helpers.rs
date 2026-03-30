@@ -46,6 +46,12 @@ pub fn config(env: &Env) -> Config {
         .expect("not initialized")
 }
 
+/// Returns the list of registered admin addresses from config storage.
+/// Use this instead of inline `config(env).admins` reads.
+pub fn get_admins(env: &Env) -> soroban_sdk::Vec<Address> {
+    config(env).admins
+}
+
 pub fn add_slash_balance(env: &Env, amount: i128) {
     let current: i128 = env
         .storage()
@@ -120,9 +126,10 @@ pub fn require_admin_approval(env: &Env, admin_signers: &Vec<Address>) {
         admin_signers.len() >= config.admin_threshold,
         "insufficient admin approvals"
     );
+    let admins = get_admins(env);
     for signer in admin_signers.iter() {
         assert!(
-            config.admins.iter().any(|a| a == signer),
+            admins.iter().any(|a| a == signer),
             "signer is not a registered admin"
         );
         signer.require_auth();
